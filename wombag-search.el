@@ -509,6 +509,13 @@ With prefix ARG only quit Wombag."
    (when-let ((url (map-elt entry 'url)))
      (eww url))))
 
+(defun w-search-open-in-wallabag ()
+  "Open Wombag entry at point in Wallabag web interface."
+  (interactive)
+  (let ((id (get-text-property (point) 'wombag-id)))
+    (funcall wombag-browse-url-function
+             (format "%s/view/%s" wombag-host id))))
+
 (defun w-search-copy ()
   "Copy URL of Wombag entry at point."
   (interactive)
@@ -707,6 +714,7 @@ When NO-CONFIRM is non-nil, do not ask for confirmation."
   "B" #'w-search-eww-open
   "&" #'w-search-browse-url
   "x" #'w-search-browse-url
+  "W" #'w-search-open-in-wallabag
   "s" #'w-search-live-filter
   "q" #'w-search-quit-window
   "g" #'w-search-update--force
