@@ -173,6 +173,13 @@ Render from positions BEGIN to END."
              (shr-inhibit-images t))
     (w-show-entry entry)))
 
+(defun w-show-open-in-wallabag ()
+  "Open this Wombag article in Wallabag web interface."
+  (interactive)
+  (when-let ((id (alist-get 'id w-show-entry)))
+    (funcall wombag-browse-url-function
+             (format "%s/view/%s" wombag-host id))))
+
 
 ;;; Major mode
 (defvar-keymap w-show-mode-map
@@ -184,6 +191,7 @@ Render from positions BEGIN to END."
   "DEL"       #'scroll-down-command
   "<"         #'beginning-of-buffer
   ">"         #'end-of-buffer
+  "W"         #'w-show-open-in-wallabag
   "q"         #'w-show-quit-window
   "I"         #'w-show-disable-images
   "C-c C-n"   #'w-heading-next
