@@ -58,6 +58,7 @@
 (require 'map)
 (require 'request)
 (require 'json)
+(require 'seq)
 (require 'wombag-options)
 (require 'wombag-db)
 
@@ -135,62 +136,68 @@ If provided, call CALLBACK with ARGS afterwards."
        (setq w-retrieving "Authenticating...")
        (w-get-token :callback func :args args)))))
 
-(defsubst w--sync-message (num-total)
-  "Adjust Wombag header message stating NUM-TOTAL."
+(defsubst w--sync-message (added deleted sweep &optional done page pages)
+  "Adjust Wombag header message for ADDED, DELETED, SWEEP, DONE, PAGE and PAGES."
   (setq w-retrieving
-        (if (= num-total 0)
-            "Retrieving... already up to date"
-          (format "Retrieving... %d entries added" num-total))))
+        (concat
+         (let ((action (if (eq sweep 'active) "Sweeping" "Retrieving")))
+           (cond (done (format "Sync%s completed. " (if sweep "/sweep" "")))
+                 (page (format "%s (%d%%%%)... " action (* 100 (/ page (float pages)))))
+                 (t    (format "%s... " action))))
+         (cl-flet ((noun (num) (if (= 1 num) "entry" "entries")))
+           (cond ((= 0 added deleted) (when done "Entries up to date"))
+                 ((= 0 deleted) (format "%d %s added" added (noun added)))
+                 ((= 0 added) (format "%d %s deleted" deleted (noun deleted)))
+                 (t (format "%d %s added, %d deleted" added (noun added) deleted)))))))
 
 ;;----------------8<-------------------
 ;; (defvar w-all-entries nil)
 ;; (defvar w-local-ids nil)
 ;;----------------8<-------------------
-(cl-defun w-sync (&key since page num-total local-ids full)
+(cl-defun w-sync (&key since sweep (page 1) (added 0) (deleted 0) max-id)
   "Synchronize the local Wombag database.
 
 This will update the local state of Wombag to that the server:
 - Fetch new entries since the last update
 - Update all metadata (archived/starred/annotations etc)
 
-With `prefix-arg' \\[universal-argument], query for date to sync
-from.
+By default, this will delete local entries that have been deleted on
+the server if they were last updated (prior to deletion) after SINCE.
+To remove all deleted entries regardless of date, this function can
+additionally perform a full SWEEP as a second phase of synchronization.
+A full sweep checks all entries but is relatively lightweight since it
+only requests metadata from the server rather than full article content.
 
-By default, it will not delete local entries that have been
-deleted on the server.
+With `prefix-arg' \\[universal-argument], perform a full sweep \
+during synchronization.
 
-With double prefix-arg \\[universal-argument]
-\\[universal-argument], do a full sweep of the database and
-delete all entries not on the Server.
-NOTE: This is not yet implemented.
+With double `prefix-arg' \\[universal-argument] \\[universal-argument], \
+prompt for both SINCE and SWEEP.
 
 Keywords:
 
 SINCE: Unix timestamp or date formatted as \"YYYY-MM-DD\" to sync
 upwards from.  (Determined automatically when not provided.)
 
-FULL: If non-nil, perform a full sweep of deleted entries on the
-server and delete them locally.
+SWEEP: If non-nil, perform a full sweep of deleted entries on the
+server and delete them locally. When the sweep executes, SWEEP gets
+set to the symbol \\='active.
 
 The remaining keywords are for internal use only
 
 PAGE: Page number of entries.
-NUM-TOTAL: Running total of new entries
-LOCAL-IDS: Ids from SINCE available locally."
+ADDED: Running total of new entries
+DELETED: Running total of deleted entries
+MAX-ID: Lowest ID from previous page of entries to serve as upper
+bound for IDs on current page"
   (interactive
-   (list :since
-         (when (= (prefix-numeric-value current-prefix-arg) 4)
-           (read-string "Sync from (2023-09-01): "))
-         :full (and (= (prefix-numeric-value current-prefix-arg) 16)
-                    (y-or-n-p
-                     "Do a full sweep of the database (This will transfer a lot of data)? "))))
-  (unless num-total
-    (setq w-retrieving "Retrieving..."
-          num-total (or num-total 0)))
-  ;;----------------8<-------------------
-  ;; (setq w-all-entries nil
-  ;;       w-local-ids nil)
-  ;;----------------8<-------------------
+   (pcase (prefix-numeric-value current-prefix-arg)
+     (4  (list :sweep t))
+     (16 (list
+          :since (read-string "Sync from (2023-09-01): ")
+          :sweep (y-or-n-p "Sweep the local database of deleted entries?")))))
+  (when (= page 1)
+    (w--sync-message added deleted sweep))
   (if since
       (unless (numberp since)
         (if (string-match-p "[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}" since)
@@ -202,71 +209,59 @@ LOCAL-IDS: Ids from SINCE available locally."
     :params `(("access_token" . ,w-token)
               ("sort"         . "created")
               ("order"        . "desc")
-              ("page"         . ,(or page 1))
+              ("page"         . ,page)
               ("perPage"      . 30)
-              ("detail"       . "full")
+              ("detail"       . ,(if (eq sweep 'active) "metadata" "full"))
               ("since"        . ,since))
     :headers '(("Content-Type" . "application/json"))
     :status-code `((401 . ,(w--retry-with-token #'w-sync
-                            :page page :since since :full full))
-                   (404 . ,(lambda (&rest _)
-                             (w-db-update-date (float-time))
-                             (w--sync-message num-total)
-                             (when full (w--sweep-deleted-entries)))))
+                            :page page :since since :sweep sweep)))
     :success
     (cl-function
      (lambda (&key data &allow-other-keys)
        "Update Wombag db if necessary"
-       (let ((num-new)
-             (all-entries (map-nested-elt data '(_embedded items)))
-             (local-ids (or local-ids
-                            (apply #'nconc
-                                   (w-db-query
-                                    `[:select id :from items
-                                      :where (>= updated_at ;created_at
-                                              ,(format-time-string "%Y-%m-%dT%H:%M:%S" since t))
-                                      :order-by (desc id)])))))
-         ;;----------------8<-------------------
-         ;; (setq w-all-entries
-         ;;       (nconc w-all-entries all-entries))
-         ;; (setq w-local-ids
-         ;;       (nconc w-local-ids local-ids))
-         ;;----------------8<-------------------
-         (if local-ids
-             (let ((server-ids))
-               (cl-loop for entry across all-entries
-                        for id = (map-elt entry 'id)
-                        do (push id server-ids)
-                        if (memq id local-ids)
-                        collect entry into updated-entries
-                        else collect entry into new-entries
-                        finally do
-                        (when new-entries
-                          (w--insert-entries :data (vconcat new-entries) :replace t))
-                        (when updated-entries
-                          (w--insert-entries :data (vconcat updated-entries) :replace t))
-                        (setq num-new (length new-entries)))
-               (when-let ((deleted-ids (cl-set-difference local-ids server-ids)))
-                 (w-db-delete (vconcat deleted-ids))))
-           (unless (= 0 (length all-entries)) (w--insert-entries :data all-entries))
-           (setq num-new (length all-entries)))
-         (if (>= (length all-entries) 30)
-             ;; There might be more entries
-             (run-with-idle-timer
-              1 nil #'w-sync
-              :page (1+ (or page 1))
-              :since since
-              :num-total (+ num-new num-total)
-              :local-ids local-ids
-              :full full)
-           (w-db-update-date (float-time))
-           (when full (w--sweep-deleted-entries)))
-         (w--sync-message (+ num-new num-total)))))
+       (let* ((all-entries (map-nested-elt data '(_embedded items)))
+              (server-ids (mapcar (lambda (e) (map-elt e 'id)) all-entries))
+              (min-id (when server-ids (apply #'min server-ids)))
+              (local-ids (apply #'nconc
+                                (w-db-query
+                                 `[:select id :from items
+                                   :where
+                                   (or
+                                    ;; To determine inserts vs updates:
+                                    (in id ,(vconcat server-ids))
+                                    ;; To determine deletes: run same query as
+                                    ;; server, by ID range for the page. Local
+                                    ;; IDs not on the server should be deleted.
+                                    (and (>= updated_at
+                                             ,(format-time-string "%FT%T" since t))
+                                         (>= id ,(or min-id 0))
+                                         (<  id ,(or max-id most-positive-fixnum))))
+                                   :order-by (desc id)])))
+              (deleted-ids (seq-difference local-ids server-ids))
+              ;; No updates while sweeping; fetch is metadata only, no content
+              (sweeping (eq sweep 'active))
+              (updated-ids (unless sweeping server-ids))
+              (added-ids (seq-difference updated-ids local-ids)))
+         (when deleted-ids
+           (w-db-delete (vconcat deleted-ids)))
+         (when updated-ids
+           (w--insert-entries :data (vconcat all-entries) :replace t))
+         (let* ((added (+ added (length added-ids)))
+                (deleted (+ deleted (length deleted-ids)))
+                (pages (map-elt data 'pages))
+                (next-args (cond ((< page pages)
+                                  (list :page (1+ page) :max-id min-id
+                                        :sweep sweep :since since
+                                        :added added :deleted deleted))
+                                 ((and sweep (not sweeping))
+                                  (list :sweep 'active :since 1
+                                        :added added :deleted deleted)))))
+           (if next-args
+               (apply #'run-with-idle-timer 1 nil #'w-sync next-args)
+             (w-db-update-date (float-time)))
+           (w--sync-message added deleted sweep (not next-args) page pages)))))
     :error #'w--debug))
-
-(defun w--sweep-deleted-entries ()
-  ";TODO: Sweeping all deleted entries not implemented yet."
-  (message "Sweeping all deleted entries not implemented yet."))
 
 ;;;; Updating the database:
 (cl-defun w--insert-entries (&key data replace &allow-other-keys)
